@@ -1,0 +1,250 @@
+repositories:
+  - name: gitlab
+    url: https://charts.gitlab.io
+  - name: jenkins
+    url: https://charts.jenkins.io
+  - name: argo
+    url: https://argoproj.github.io/argo-helm
+  - name: istio
+    url: https://istio-release.storage.googleapis.com/charts
+  - name: prometheus
+    url: https://prometheus-community.github.io/helm-charts
+  - name: grafana
+    url: https://grafana.github.io/helm-charts
+  - name: open-telemetry
+    url: https://open-telemetry.github.io/opentelemetry-helm-charts
+
+environments:
+  development:
+    values:
+      - helm/environments/dev.yaml
+  staging:
+    values:
+      - helm/environments/staging.yaml
+  production:
+    values:
+      - helm/environments/prod.yaml
+
+releases:
+  - name: istio-base
+    namespace: istio-system
+    createNamespace: true
+    chart: istio/base
+    version: 1.20.0
+    
+  - name: istiod
+    namespace: istio-system
+    chart: istio/istiod
+    version: 1.20.0
+    needs:
+      - istio-system/istio-base
+    values:
+      - pilot:
+          autoscaleEnabled: false
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+      - meshConfig:
+          defaultConfig:
+            proxyStatsMatcher:
+              inclusionRegexps:
+                - ".*outlier_detection.*"
+                - ".*osconfig.*"
+                - ".*circuit_breakers.*"
+      - telemetry:
+          v2:
+            prometheus:
+              configOverride:
+                inboundSidecar:
+                  disable_host_header_fallback: true
+                outboundSidecar:
+                  disable_host_header_fallback: true
+                
+  - name: istio-ingress
+    namespace: istio-system
+    chart: istio/gateway
+    version: 1.20.0
+    needs:
+      - istio-system/istiod
+    values:
+      - service:
+          type: LoadBalancer
+          
+  {{- if eq .Environment.Name "development" }}
+  
+  - name: gitlab
+    namespace: gitlab
+    createNamespace: true
+    chart: gitlab/gitlab
+    version: 7.6.0
+    values:
+      - global:
+          edition: ce
+          hosts:
+            domain: gitlab.local
+          ingress:
+            enabled: false
+          postgresql:
+            install: true
+          redis:
+            install: true
+          minio:
+            enabled: true
+            
+  - name: jenkins
+    namespace: jenkins
+    createNamespace: true
+    chart: jenkins/jenkins
+    version: 4.8.0
+    values:
+      - controller:
+          adminPassword: admin123
+          installPlugins:
+            - kubernetes:3900.va_dce992317b_4
+            - workflow-aggregator:596.v8c21c963d92d
+            - git:5.2.0
+            - configuration-as-code:1647.ve39ca_b_829b_42
+            - docker-workflow:572.v950f58993843
+            - gitlab-plugin:1.7.16
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+          JCasC:
+            configScripts:
+              jenkins-config: |
+                jenkins:
+                  clouds:
+                    - kubernetes:
+                        name: kubernetes
+                        serverUrl: https://kubernetes.default
+                        namespace: jenkins
+                        jenkinsUrl: http://jenkins:8080
+                        templates:
+                          - name: dind
+                            label: dind
+                            containers:
+                              - name: dind
+                                image: docker:dind
+                                privileged: true
+                          - name: python
+                            label: python
+                            containers:
+                              - name: python
+                                image: python:3.11-slim
+                          - name: golang
+                            label: golang
+                            containers:
+                              - name: golang
+                                image: golang:1.21
+                                
+  - name: argocd
+    namespace: argocd
+    createNamespace: true
+    chart: argo/argo-cd
+    version: 5.51.0
+    values:
+      - server:
+          service:
+            type: LoadBalancer
+      - configs:
+          params:
+            server.insecure: true
+  {{- end }}
+  
+  - name: prometheus
+    namespace: monitoring
+    createNamespace: true
+    chart: prometheus/kube-prometheus-stack
+    version: 55.0.0
+    values:
+      - prometheus:
+          prometheusSpec:
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp2
+                  resources:
+                    requests:
+                      storage: 10Gi
+                      
+  - name: loki
+    namespace: monitoring
+    chart: grafana/loki-stack
+    version: 2.10.0
+    values:
+      - loki:
+          persistence:
+            enabled: true
+            size: 10Gi
+            
+  - name: tempo
+    namespace: monitoring
+    chart: grafana/tempo
+    version: 1.7.0
+    values:
+      - tempo:
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              
+  - name: opentelemetry
+    namespace: monitoring
+    chart: open-telemetry/opentelemetry-collector
+    version: 0.73.0
+    values:
+      - mode: deployment
+      - config:
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: 0.0.0.0:4317
+                http:
+                  endpoint: 0.0.0.0:4318
+          exporters:
+            prometheus:
+              endpoint: "0.0.0.0:8889"
+            loki:
+              endpoint: http://loki:3100/loki/api/v1/push
+            tempo:
+              endpoint: tempo:4317
+              
+  - name: grafana
+    namespace: monitoring
+    chart: grafana/grafana
+    version: 7.0.0
+    values:
+      - adminPassword: admin123
+      - datasources:
+          datasources.yaml:
+            apiVersion: 1
+            datasources:
+              - name: Prometheus
+                type: prometheus
+                url: http://prometheus-kube-prometheus-prometheus:9090
+                isDefault: true
+              - name: Loki
+                type: loki
+                url: http://loki:3100
+              - name: Tempo
+                type: tempo
+                url: http://tempo:3100
+      - dashboardProviders:
+          dashboardproviders.yaml:
+            apiVersion: 1
+            providers:
+              - name: default
+                orgId: 1
+                folder: ''
+                type: file
+                disableDeletion: false
+                updateIntervalSeconds: 10
+                options:
+                  path: /var/lib/grafana/dashboards/default

@@ -1,0 +1,192 @@
+pipeline {
+    agent {
+        kubernetes {
+            label 'dind'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: dind
+    image: docker:dind
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run
+  - name: docker
+    image: docker:cli
+    command: ['cat']
+    tty: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run
+  - name: yq
+    image: mikefarah/yq:4
+    command: ['cat']
+    tty: true
+  volumes:
+  - name: docker-sock
+    emptyDir: {}
+"""
+        }
+    }
+    
+    environment {
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.eu-north-1.amazonaws.com"
+        ECR_REPOSITORY = "web-app"
+        GITLAB_CREDS = credentials('gitlab-token')
+        SLACK_WEBHOOK = credentials('slack-webhook')
+    }
+    
+    options {
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'http://gitlab.development.local/app/web-app.git',
+                        credentialsId: 'gitlab-token'
+                    ]]
+                ])
+            }
+        }
+        
+        stage('Tests') {
+            failFast true
+            parallel {
+                stage('SAST') {
+                    steps {
+                        container('docker') {
+                            sh '''
+                                docker build --target sast -t sast-test .
+                                docker run --rm sast-test
+                            '''
+                        }
+                    }
+                }
+                stage('Lint') {
+                    steps {
+                        container('docker') {
+                            sh '''
+                                docker build --target lint -t lint-test .
+                                docker run --rm lint-test
+                            '''
+                        }
+                    }
+                }
+                stage('Unit Tests') {
+                    steps {
+                        container('docker') {
+                            sh '''
+                                docker build --target unit-test -t unit-test .
+                                docker run --rm unit-test
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Image') {
+            steps {
+                container('docker') {
+                    script {
+                        sh """
+                            docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER} .
+                            docker tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            steps {
+                container('docker') {
+                    sh '''
+                        docker build --target integration-test -t integration-test .
+                        docker run --rm integration-test
+                    '''
+                }
+            }
+        }
+        
+        stage('DAST') {
+            steps {
+                container('docker') {
+                    sh '''
+                        docker run --rm -d --name test-app ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}
+                        docker build --target dast -t dast-test .
+                        docker run --rm --link test-app:app dast-test
+                        docker stop test-app
+                    '''
+                }
+            }
+        }
+        
+        stage('Smoke Test') {
+            steps {
+                container('docker') {
+                    sh """
+                        docker run --rm -d --name smoke-app -p 8080:8080 ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}
+                        sleep 5
+                        curl -f http://localhost:8080/health || exit 1
+                        docker stop smoke-app
+                    """
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            steps {
+                container('docker') {
+                    sh """
+                        aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                    """
+                }
+            }
+        }
+        
+        stage('Update GitOps') {
+            steps {
+                container('yq') {
+                    sh """
+                        git clone http://${GITLAB_CREDS}@gitlab.development.local/gitops/manifests.git
+                        cd manifests
+                        yq eval '.spec.template.spec.containers[0].image = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}"' -i apps/web-app/deployment.yaml
+                        git config user.email "jenkins@ci.local"
+                        git config user.name "Jenkins CI"
+                        git add .
+                        git commit -m "Update web-app to version ${BUILD_NUMBER}"
+                        git push origin main
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            sh """
+                curl -X POST ${SLACK_WEBHOOK} -H 'Content-Type: application/json' \
+                -d '{"text":"✅ Build #${BUILD_NUMBER} succeeded\\nCommit: ${GIT_COMMIT}"}'
+            """
+        }
+        failure {
+            sh """
+                curl -X POST ${SLACK_WEBHOOK} -H 'Content-Type: application/json' \
+                -d '{"text":"❌ Build #${BUILD_NUMBER} failed\\nCommit: ${GIT_COMMIT}"}'
+            """
+        }
+    }
+}

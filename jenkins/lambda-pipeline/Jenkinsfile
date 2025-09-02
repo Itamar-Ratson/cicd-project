@@ -1,0 +1,51 @@
+pipeline {
+    agent {
+        kubernetes {
+            label 'docker'
+        }
+    }
+    
+    environment {
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.eu-north-1.amazonaws.com"
+    }
+    
+    stages {
+        stage('Build Lambda Images') {
+            parallel {
+                stage('CSV Processor') {
+                    steps {
+                        container('docker') {
+                            sh """
+                                cd lambda-csv-processor
+                                docker build -t ${ECR_REGISTRY}/lambda-csv-processor:latest .
+                                aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                                docker push ${ECR_REGISTRY}/lambda-csv-processor:latest
+                            """
+                        }
+                    }
+                }
+                stage('Slack Notifier') {
+                    steps {
+                        container('docker') {
+                            sh """
+                                cd lambda-slack-notifier
+                                docker build -t ${ECR_REGISTRY}/lambda-slack-notifier:latest .
+                                aws ecr get-login-password --region eu-north-1 | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                                docker push ${ECR_REGISTRY}/lambda-slack-notifier:latest
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Update Lambda Functions') {
+            steps {
+                sh """
+                    aws lambda update-function-code --function-name gitlab-csv-processor --image-uri ${ECR_REGISTRY}/lambda-csv-processor:latest --region eu-north-1 || true
+                    aws lambda update-function-code --function-name slack-notifier --image-uri ${ECR_REGISTRY}/lambda-slack-notifier:latest --region eu-north-1 || true
+                """
+            }
+        }
+    }
+}
